@@ -51,6 +51,12 @@ printf '%s' "$REVISION" | grep -Eq '^[A-Za-z0-9.+-~]+$' || {
   echo "Invalid Debian revision: $REVISION" >&2; exit 2;
 }
 
+# Anchor the output directory so later `cd`/relative paths cannot break it.
+case "$OUT_DIR" in
+  /*) ;;
+  *) OUT_DIR="$PWD/$OUT_DIR" ;;
+esac
+
 DEB_VERSION="${VERSION}-${REVISION}"
 PACKAGE="zcode-cli"
 STAGE="$OUT_DIR/stage"
@@ -135,8 +141,7 @@ dpkg-deb --build --root-owner-group -Zxz "$STAGE" "$DEB_FILE"
 dpkg-deb --info "$DEB_FILE"
 dpkg-deb --contents "$DEB_FILE" | head -20
 
-cd "$OUT_DIR"
-sha256sum "$(basename "$DEB_FILE")" > SHA256SUMS.txt
+sha256sum "$DEB_FILE" > "$OUT_DIR/SHA256SUMS.txt"
 rm -rf "$STAGE"
 
 echo
