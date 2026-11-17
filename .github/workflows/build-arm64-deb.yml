@@ -119,8 +119,15 @@ jobs:
           timeout 60 zcode --help | head -20
           echo "--- uninstall ---"
           sudo dpkg -r zcode-cli
+          # Bash caches the earlier resolved path; clear it before re-checking,
+          # and verify the package files are actually gone.
+          hash -r
+          if [ -e /usr/bin/zcode ] || [ -e /opt/zcode/bin/zcode ]; then
+            echo "ERROR: package files still present after removal" >&2
+            exit 1
+          fi
           if command -v zcode >/dev/null 2>&1; then
-            echo "ERROR: zcode still on PATH after removal" >&2
+            echo "ERROR: zcode still resolves to $(command -v zcode) after removal" >&2
             exit 1
           fi
           echo "Uninstall verified."
