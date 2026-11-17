@@ -55,7 +55,26 @@ jobs:
           # The CLI build never touches the desktop package; skip the Electron
           # binary download (~120 MB) to keep the install lean.
           ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
-        run: pnpm install --frozen-lockfile
+        # Parallel postinstall builds (node-pty node-gyp, esbuild, koffi, ...)
+        # can race pnpm's hoisted linking on the ARM64 runner and fail with a
+        # transient ERR_PNPM_ENOENT rename error. Retry, escalating to a full
+        # node_modules wipe before the final attempt.
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::pnpm install --frozen-lockfile (attempt ${attempt} of 3)"
+            if pnpm install --frozen-lockfile; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "pnpm install failed (attempt ${attempt})."
+            if [ "${attempt}" -lt 3 ]; then
+              echo "Removing materialized node_modules trees before retrying."
+              find . -depth -type d -name node_modules -prune -exec rm -rf {} \;
+            fi
+          done
+          echo "pnpm install failed after 3 attempts." >&2
+          exit 1
 
       - name: Build CLI workspace (upstream build:sea:prepare)
         run: pnpm run build:sea:prepare
