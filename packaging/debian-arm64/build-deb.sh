@@ -141,7 +141,9 @@ dpkg-deb --build --root-owner-group -Zxz "$STAGE" "$DEB_FILE"
 dpkg-deb --info "$DEB_FILE"
 dpkg-deb --contents "$DEB_FILE" | head -20
 
-sha256sum "$DEB_FILE" > "$OUT_DIR/SHA256SUMS.txt"
+# Record the bare file name so `sha256sum -c SHA256SUMS.txt` works wherever
+# the package is downloaded, not just on the build machine.
+sha256sum "$DEB_FILE" | sed "s|  $DEB_FILE\$|  $(basename "$DEB_FILE")|" > "$OUT_DIR/SHA256SUMS.txt"
 rm -rf "$STAGE"
 
 echo
