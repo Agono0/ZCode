@@ -1,0 +1,172 @@
+name: Build ARM64 .deb
+
+# Builds the official Z.ai ZCode CLI (terminal UI + agent, CLI only — no desktop
+# app) as a self-contained Debian ARM64 (.deb) package, entirely on GitHub's
+# native ARM64 runner. Upstream sources are built unmodified; authentication is
+# the official Z.ai OAuth device flow / Coding Plan implementation shipped by
+# upstream (`zcode login`, `/login`, Coding Plan key management).
+#
+# The artifact is the upstream-supported Node.js SEA single executable
+# (`apps/zcode-cli/packages/cli/scripts/build-sea.mjs --target linux-arm64`),
+# so the .deb needs no system Node.js — Debian's nodejs package is far older
+# than the Node 24 runtime ZCode requires.
+
+on:
+  workflow_dispatch:
+    inputs:
+      deb_revision:
+        description: "Debian package revision appended as <upstream-version>-<rev>"
+        required: false
+        default: "1"
+
+permissions:
+  contents: write # publish the GitHub Release
+
+concurrency:
+  group: build-arm64-deb
+  cancel-in-progress: false
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-24.04-arm # native ARM64 runner (free for public repos)
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js (version pinned by upstream mise.toml)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+
+      - name: Install pnpm (version pinned by upstream mise.toml)
+        run: npm install -g pnpm@10.33.2
+
+      - name: Show toolchain
+        run: |
+          node --version
+          pnpm --version
+          dpkg --print-architecture
+          uname -m
+
+      - name: Install workspace dependencies
+        env:
+          # The CLI build never touches the desktop package; skip the Electron
+          # binary download (~120 MB) to keep the install lean.
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+        run: pnpm install --frozen-lockfile
+
+      - name: Build CLI workspace (upstream build:sea:prepare)
+        run: pnpm run build:sea:prepare
+
+      - name: Build SEA single executable for linux-arm64
+        run: node apps/zcode-cli/packages/cli/scripts/build-sea.mjs --target linux-arm64
+
+      - name: Smoke-test SEA binary
+        run: |
+          BIN="apps/zcode-cli/packages/cli/dist/zcode-linux-arm64"
+          test -x "$BIN"
+          "$BIN" --version
+
+      - name: Package .deb
+        id: deb
+        env:
+          DEB_REVISION: ${{ inputs.deb_revision || '1' }}
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          bash packaging/debian-arm64/build-deb.sh \
+            --binary "apps/zcode-cli/packages/cli/dist/zcode-linux-arm64" \
+            --version "$VERSION" \
+            --revision "$DEB_REVISION" \
+            --source-commit "$GITHUB_SHA" \
+            --out-dir dist-deb
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "revision=$DEB_REVISION" >> "$GITHUB_OUTPUT"
+
+      - name: Verify .deb (install, run, uninstall)
+        run: |
+          set -e
+          DEB_FILE="$(ls dist-deb/zcode-cli_*_arm64.deb)"
+          echo "Installing $DEB_FILE"
+          sudo dpkg -i "$DEB_FILE"
+          dpkg -s zcode-cli
+          dpkg -L zcode-cli
+          echo "--- command resolution ---"
+          test "$(command -v zcode)" = "/usr/bin/zcode"
+          echo "--- zcode --version ---"
+          zcode --version
+          echo "--- zcode --help (timeout guard) ---"
+          timeout 60 zcode --help | head -20
+          echo "--- uninstall ---"
+          sudo dpkg -r zcode-cli
+          if command -v zcode >/dev/null 2>&1; then
+            echo "ERROR: zcode still on PATH after removal" >&2
+            exit 1
+          fi
+          echo "Uninstall verified."
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-cli-arm64-deb
+          path: |
+            dist-deb/*.deb
+            dist-deb/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.deb.outputs.version }}
+          REVISION: ${{ steps.deb.outputs.revision }}
+        run: |
+          TAG="zcode-cli-v${VERSION}"
+          DEB_FILE="$(ls dist-deb/zcode-cli_*_arm64.deb)"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists (same upstream version rebuilt); replacing it."
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+
+          {
+            echo "**Z.ai ZCode CLI $VERSION — Debian ARM64 (.deb)**"
+            echo
+            echo "Built on GitHub Actions from the official [zai-org/ZCode](https://github.com/zai-org/ZCode) source (commit $GITHUB_SHA, CLI only — no desktop app)."
+            echo
+            echo "\`\`\`bash"
+            echo "# Install / upgrade"
+            echo "apt install ./zcode-cli_${VERSION}-${REVISION}_arm64.deb"
+            echo
+            echo "# Uninstall"
+            echo "apt remove zcode-cli"
+            echo "\`\`\`"
+            echo
+            echo "Full install, login, upgrade, and uninstall instructions: [packaging/debian-arm64/README.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/packaging/debian-arm64/README.md)"
+            echo
+            echo "\`sha256sum\` (see SHA256SUMS.txt):"
+            echo
+            echo "\`\`\`"
+            cat dist-deb/SHA256SUMS.txt
+            echo "\`\`\`"
+          } > release-notes.md
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "ZCode CLI v${VERSION} — ARM64 .deb (rev ${REVISION})" \
+            --notes-file release-notes.md \
+            "$DEB_FILE" "dist-deb/SHA256SUMS.txt"
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.deb.outputs.version }}
+        run: |
+          {
+            echo "## ZCode CLI ARM64 .deb"
+            echo "- Upstream version: ${VERSION}"
+            echo "- Package: \`zcode-cli_${VERSION}\` (\`dpkg -i\` / \`apt install ./...\`)"
+            echo "- Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/zcode-cli-v${VERSION}"
+            echo "- Artifact: \`zcode-cli-arm64-deb\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,83 @@
+name: Sync upstream and rebuild
+
+# Keeps this fork a fast-forward of zai-org/ZCode (no local modifications to
+# upstream files — only additive packaging/workflow files) and re-runs the
+# ARM64 .deb build whenever upstream publishes a new version.
+
+on:
+  schedule:
+    - cron: "23 4 * * 1" # weekly, Monday 04:23 UTC
+  workflow_dispatch:
+    inputs:
+      rebuild:
+        description: "Trigger the ARM64 .deb build after a successful sync"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/zai-org/ZCode.git
+          git fetch upstream main
+
+      - name: Fast-forward main to upstream/main
+        id: sync
+        run: |
+          BEFORE="$(git rev-parse HEAD)"
+          AFTER="$(git rev-parse upstream/main)"
+          echo "before=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "after=$AFTER" >> "$GITHUB_OUTPUT"
+
+          if [ "$BEFORE" = "$AFTER" ]; then
+            echo "Already up to date with upstream/main."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout main
+          git merge --ff-only upstream/main
+
+      - name: Push synced main
+        if: steps.sync.outputs.before != steps.sync.outputs.after
+        run: git push origin main
+
+      - name: Report divergence (if upstream history moved incompatibly)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Upstream sync failed: main diverged from zai-org/ZCode" \
+            --body "The weekly fast-forward merge of \`zai-org/ZCode\` into \`main\` failed. Inspect the [workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) and resolve manually."
+
+      - name: Rebuild .deb after upstream update
+        if: >-
+          steps.sync.outputs.before != steps.sync.outputs.after &&
+          (inputs.rebuild == true || github.event_name == 'schedule')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "Upstream moved to $VERSION; dispatching build-arm64-deb."
+          gh workflow run build-arm64-deb.yml --repo "$GITHUB_REPOSITORY" --ref main
